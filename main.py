@@ -1,3 +1,4 @@
+
 import yfinance as yf
 import time
 import smtplib
@@ -5,10 +6,18 @@ from email.mime.text import MIMEText
 from datetime import datetime
 import os
 import random
+from groq import Groq
 
 # ============================================
 # CONFIGURATION - EDIT THESE
 # ============================================
+
+# GROQ API Configuration (pon tu API key aquí o en variable de entorno)
+GROQ_API_KEY = "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"
+# O mejor: os.environ.get('GROQ_API_KEY', '')
+
+# Initialize Groq client
+client = Groq(api_key=GROQ_API_KEY)
 
 # Your watchlist with price levels
 WATCHLIST = {
@@ -19,21 +28,141 @@ WATCHLIST = {
 }
 
 # Email settings (get these from environment variables)
-EMAIL_ENABLED = False  # Set to True when you add email credentials
+EMAIL_ENABLED = False
 EMAIL_SENDER = os.environ.get('EMAIL_SENDER', '')
 EMAIL_PASSWORD = os.environ.get('EMAIL_PASSWORD', '')
 EMAIL_RECIPIENT = os.environ.get('EMAIL_RECIPIENT', '')
 
+# AI Analysis settings
+AI_ENABLED = True  # Set to False to disable AI analysis
+AI_ANALYSIS_INTERVAL = 6  # Run AI analysis every N cycles (6 ciclos = ~15 minutos)
+
 # ============================================
 # ANTI-RATE-LIMITING CONFIG
 # ============================================
-DELAY_BETWEEN_TICKERS = 5  # Seconds between each ticker (5-8 is safe)
-DELAY_BETWEEN_CYCLES = 120  # Seconds between complete cycles (2 minutes)
-MAX_RETRIES = 3  # Max retries if rate limited
-RETRY_DELAY = 30  # Seconds to wait if rate limited
+DELAY_BETWEEN_TICKERS = 5
+DELAY_BETWEEN_CYCLES = 120
+MAX_RETRIES = 3
+RETRY_DELAY = 30
 
 # ============================================
-# CORE FUNCTIONS
+# AI ANALYSIS FUNCTIONS
+# ============================================
+
+def get_ai_market_insight():
+    """Get market insight from Groq AI"""
+    prompt = f"""You are a professional stock market analyst. Provide a brief analysis of the current market situation for TSX stocks.
+    Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    
+    Please provide:
+    1. A general market sentiment (Bullish/Bearish/Neutral)
+    2. One key insight for today's trading
+    3. A cautionary note for traders
+    
+    Keep it concise, maximum 3 sentences."""
+    
+    try:
+        completion = client.chat.completions.create(
+            model="openai/gpt-oss-120b",  # or "mixtral-8x7b-32768" for faster response
+            messages=[
+                {"role": "system", "content": "You are a professional stock market analyst providing concise, accurate insights."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            max_completion_tokens=300,
+            top_p=1,
+            stream=False  # False para respuesta completa
+        )
+        
+        return completion.choices[0].message.content
+        
+    except Exception as e:
+        print(f"❌ AI Analysis Error: {e}")
+        return None
+
+def analyze_stock_with_ai(symbol, price, change, historical_data):
+    """Get AI analysis for a specific stock"""
+    
+    # Crear resumen de datos históricos
+    recent_prices = historical_data['Close'].tail(10).tolist() if not historical_data.empty else []
+    recent_changes = historical_data['Close'].pct_change().tail(10).tolist() if not historical_data.empty else []
+    
+    prompt = f"""Analyze this stock:
+    
+    Symbol: {symbol}
+    Current Price: ${price:.2f}
+    Daily Change: {change:+.2f}%
+    
+    Recent prices (last 10 periods): {[f'${p:.2f}' for p in recent_prices]}
+    
+    Based on this data, provide:
+    1. A BUY/SELL/HOLD recommendation
+    2. Confidence level (1-10)
+    3. Brief reasoning (1 sentence)
+    
+    Format: RECOMMENDATION|CONFIDENCE|REASONING"""
+    
+    try:
+        completion = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {"role": "system", "content": "You are a technical analyst. Provide stock recommendations based on price action."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.5,
+            max_completion_tokens=150,
+            stream=False
+        )
+        
+        result = completion.choices[0].message.content
+        parts = result.split('|')
+        
+        if len(parts) == 3:
+            return {
+                'recommendation': parts[0].strip(),
+                'confidence': parts[1].strip(),
+                'reasoning': parts[2].strip()
+            }
+        else:
+            return None
+            
+    except Exception as e:
+        print(f"❌ Stock AI Analysis Error: {e}")
+        return None
+
+def stream_ai_analysis(prompt):
+    """Stream AI response in real-time (like your example)"""
+    try:
+        completion = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {"role": "system", "content": "You are a helpful trading assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=1,
+            max_completion_tokens=8192,
+            top_p=1,
+            reasoning_effort="medium",
+            stream=True,
+            stop=None
+        )
+
+        print("\n🤖 AI Assistant: ", end="")
+        full_response = ""
+        for chunk in completion:
+            content = chunk.choices[0].delta.content or ""
+            print(content, end="", flush=True)
+            full_response += content
+        print("\n")
+        
+        return full_response
+        
+    except Exception as e:
+        print(f"❌ AI Stream Error: {e}")
+        return None
+
+# ============================================
+# CORE FUNCTIONS (originales modificadas)
 # ============================================
 
 def send_alert(message):
@@ -60,14 +189,10 @@ def get_price_with_retry(symbol, retries=0):
     """Get price with retry logic for rate limiting"""
     try:
         ticker = yf.Ticker(symbol)
-        # Add random delay to appear more human
         time.sleep(random.uniform(1, 3))
-        
-        # Use 5m interval instead of 1m to reduce requests
         hist = ticker.history(period='1d', interval='5m')
         
         if hist.empty:
-            # Try with different interval if empty
             hist = ticker.history(period='1d', interval='30m')
             
         return hist
@@ -76,22 +201,19 @@ def get_price_with_retry(symbol, retries=0):
         error_str = str(e)
         if "Too Many Requests" in error_str and retries < MAX_RETRIES:
             wait_time = RETRY_DELAY * (retries + 1)
-            print(f"  ⏳ Rate limited on {symbol}. Waiting {wait_time}s before retry {retries + 1}/{MAX_RETRIES}...")
+            print(f"  ⏳ Rate limited on {symbol}. Waiting {wait_time}s...")
             time.sleep(wait_time)
             return get_price_with_retry(symbol, retries + 1)
         else:
             raise e
 
-def check_prices():
-    """Check current prices for all symbols with delays between requests"""
+def check_prices(cycle_number):
+    """Check current prices for all symbols with AI analysis"""
     print(f"\n📊 Checking prices at {datetime.now().strftime('%H:%M:%S')}")
-    print(f"⏱️  Using {DELAY_BETWEEN_TICKERS}s delay between tickers")
     
     for i, (symbol, levels) in enumerate(WATCHLIST.items()):
         try:
-            # Add delay between tickers (skip delay for first ticker)
             if i > 0:
-                print(f"  ⏳ Waiting {DELAY_BETWEEN_TICKERS} seconds before next ticker...")
                 time.sleep(DELAY_BETWEEN_TICKERS)
             
             print(f"  🔍 Fetching {symbol}...")
@@ -103,6 +225,13 @@ def check_prices():
                 change = ((price - open_price) / open_price) * 100
                 
                 print(f"  ✅ {symbol}: ${price:.2f} ({change:+.2f}%)")
+                
+                # AI Analysis for this stock (every 3 cycles)
+                if AI_ENABLED and cycle_number % 3 == 0:
+                    ai_analysis = analyze_stock_with_ai(symbol, price, change, hist)
+                    if ai_analysis:
+                        print(f"  🤖 AI: {ai_analysis['recommendation']} (Confidence: {ai_analysis['confidence']}/10)")
+                        print(f"     💡 {ai_analysis['reasoning']}")
                 
                 # Check buy zones
                 if 'buy' in levels and price <= levels['buy'] * 1.01:
@@ -129,30 +258,47 @@ def check_prices():
                         
         except Exception as e:
             print(f"  ❌ Error checking {symbol}: {e}")
-            # Continue with next ticker even if this one failed
 
 def main():
-    """Main loop"""
-    print("\n" + "="*50)
-    print(f"🚀 DIP & TIDE BOT STARTED at {datetime.now()}")
-    print("="*50)
+    """Main loop with AI integration"""
+    print("\n" + "="*60)
+    print(f"🚀 DIP & TIDE BOT WITH AI STARTED at {datetime.now()}")
+    print("="*60)
     print(f"📈 Watching {len(WATCHLIST)} symbols")
-    print(f"⏱️  Cycle time: ~{len(WATCHLIST) * DELAY_BETWEEN_TICKERS + 10}s + {DELAY_BETWEEN_CYCLES}s pause")
+    print(f"🤖 AI Analysis: {'ENABLED' if AI_ENABLED else 'DISABLED'}")
+    
+    # Test AI connection
+    if AI_ENABLED:
+        print("\n🔄 Testing AI connection...")
+        test = get_ai_market_insight()
+        if test:
+            print(f"✅ AI Connected: {test}")
+        else:
+            print("⚠️ AI connection failed, but bot will continue without AI")
     
     cycle_count = 0
     
     while True:
         try:
             cycle_count += 1
-            print(f"\n{'='*50}")
-            print(f"🔄 CYCLE #{cycle_count} starting at {datetime.now().strftime('%H:%M:%S')}")
-            print(f"{'='*50}")
+            print(f"\n{'='*60}")
+            print(f"🔄 CYCLE #{cycle_count} at {datetime.now().strftime('%H:%M:%S')}")
+            print(f"{'='*60}")
             
-            check_prices()
+            # Regular price checking
+            check_prices(cycle_count)
             
-            # Long pause between complete cycles
-            print(f"\n⏸️  Cycle #{cycle_count} complete. Waiting {DELAY_BETWEEN_CYCLES} seconds before next cycle...")
-            print(f"🕒 Next check at: {(datetime.fromtimestamp(time.time() + DELAY_BETWEEN_CYCLES)).strftime('%H:%M:%S')}")
+            # Market-wide AI analysis every AI_ANALYSIS_INTERVAL cycles
+            if AI_ENABLED and cycle_count % AI_ANALYSIS_INTERVAL == 0:
+                print("\n🤖 Running AI Market Analysis...")
+                
+                # Stream a market insight
+                prompt = f"Give me a quick market update for TSX stocks. Current time: {datetime.now().strftime('%H:%M')}"
+                stream_ai_analysis(prompt)
+            
+            # Long pause between cycles
+            next_check = datetime.fromtimestamp(time.time() + DELAY_BETWEEN_CYCLES)
+            print(f"\n⏸️  Cycle #{cycle_count} complete. Next check at: {next_check.strftime('%H:%M:%S')}")
             time.sleep(DELAY_BETWEEN_CYCLES)
             
         except KeyboardInterrupt:
@@ -160,7 +306,6 @@ def main():
             break
         except Exception as e:
             print(f"❌ Error in main loop: {e}")
-            print(f"⏳ Waiting {DELAY_BETWEEN_CYCLES} seconds before retry...")
             time.sleep(DELAY_BETWEEN_CYCLES)
 
 # ============================================
