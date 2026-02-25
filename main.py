@@ -1,316 +1,428 @@
+"""
+DIP & TIDE QUANT SYSTEM v13.0
+Configurable Investigation Parameters + Live Data (Finnhub) + Groq AI integration
+"""
 
-import yfinance as yf
+import requests
 import time
+import json
+import os
+from datetime import datetime
 import smtplib
 from email.mime.text import MIMEText
-from datetime import datetime
-import os
-import random
-from groq import Groq
+import yfinance as yf  # kept for historical data & backup
 
 # ============================================
-# CONFIGURATION - EDIT THESE
+# INVESTIGATION PARAMETERS – EDIT THESE
 # ============================================
 
-# GROQ API Configuration (pon tu API key aquí o en variable de entorno)
+# ---------- TIDE SCORE FORMULA ----------
+tide_roc_weight = 0.6
+tide_min_weight = -0.4
+
+tide_strong_buy = -1.5
+tide_buy = -0.5
+tide_sell = 0.5
+tide_strong_sell = 1.5
+
+# ---------- TECHNICAL INDICATORS ----------
+rsi_oversold = 30
+rsi_overbought = 70
+adx_trending = 25
+volume_ratio_min = 1.0
+volume_ratio_daytrade = 1.2
+sma_short = 20
+sma_medium = 50
+sma_long = 200
+support_resistance_lookback = 20
+near_level_percent = 2
+
+# ---------- SECTOR STRENGTH ----------
+max_sector_rank = 3
+
+# ---------- OPTIONS FLOW / GAMMA ----------
+gamma_multiplier_near_expiry = 5.0
+gamma_multiplier_medium = 2.5
+gamma_multiplier_normal = 1.0
+
+# ---------- RISK MANAGEMENT ----------
+default_risk_per_trade = 0.01
+confidence_to_risk = {
+    10: 0.02,
+    9: 0.015,
+    8: 0.01,
+    7: 0.01,
+    6: 0.005,
+    5: 0.002,
+    4: 0.001,
+    3: 0.0,
+    2: 0.0,
+    1: 0.0
+}
+stop_loss_pct = 0.03
+option_stop_loss_pct = 0.50
+daily_loss_limit_pct = 0.03
+weekly_loss_limit_pct = 0.06
+
+# ---------- ALERTS ----------
+email_enabled = False
+email_sender = ""
+email_password = ""
+email_recipient = ""
+
+telegram_enabled = False
+telegram_bot_token = ""
+telegram_chat_id = ""
+
+# ============================================
+# API KEYS (Provided by user)
+# ============================================
+FINNHUB_API_KEY = "d6f6ilpr01qvn4o20oagd6f6ilpr01qvn4o20ob0"
 GROQ_API_KEY = "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"
-# O mejor: os.environ.get('GROQ_API_KEY', '')
 
-# Initialize Groq client
-client = Groq(api_key=GROQ_API_KEY)
-
-# Your watchlist with price levels
-WATCHLIST = {
-    'TECK-B.TO': {'buy': 78.97, 'sell': 83.76, 'stop': 84.56},
-    'HUZ.TO': {'buy': 33.50, 'sell': 36.50, 'stop': 31.50},
-    'AEM.TO': {'buy': 320.00, 'sell': 345.00, 'stop': 315.00},
-    'TMQ.TO': {'sell': [6.50, 7.00, 8.00], 'stop': 4.50},
+# ============================================
+# YOUR QUESTRADE HOLDINGS (as of 2026-02-24)
+# ============================================
+portfolio = {
+    'ARG.TO': {'shares': 200, 'avg_cost': 6.12, 'sector': 'MATERIALS', 'stop': 5.50, 'targets': [6.50, 7.00, 8.00]},
+    'CNQ.TO': {'shares': 25, 'avg_cost': 43.40, 'sector': 'ENERGY', 'trailing_stop': 55.00, 'trailing_pct': 5},
+    'HBM.TO': {'shares': 30, 'avg_cost': 35.01, 'sector': 'MATERIALS', 'stop': 33.00, 'targets': [38.00, 42.00]},
+    'MU.TO': {'shares': 21, 'avg_cost': 86.77, 'sector': 'TECHNOLOGY', 'stop': 85.00, 'targets': [95.00, 100.00]},
+    'NVDA': {'shares': 25, 'avg_cost': 43.54, 'sector': 'TECHNOLOGY', 'stop': 40.00, 'targets': [45.00, 50.00]},
+    'TMQ.TO': {'shares': 135, 'avg_cost': 8.42, 'sector': 'MATERIALS', 'stop': 4.50, 'targets': [6.50, 7.00, 8.00], 'notes': 'TD upgraded to BUY @ $8.00'},
+    'VEE.TO': {'shares': 22, 'avg_cost': 47.03, 'sector': 'EMERGING', 'stop': 45.00, 'targets': [50.00, 55.00]},
+    'XGD.TO': {'shares': 20, 'avg_cost': 58.70, 'sector': 'GOLD', 'stop': 60.00, 'targets': [70.00, 75.00]},
+    'EWY': {'shares': 10, 'avg_cost': 117.61, 'sector': 'INTERNATIONAL', 'stop': 110.00, 'targets': [150.00], 'note': 'P/E 293x - overvalued'},
+    'EWZ': {'shares': 15, 'avg_cost': 36.72, 'sector': 'INTERNATIONAL', 'stop': 35.00, 'targets': [42.00, 45.00]}
 }
 
-# Email settings (get these from environment variables)
-EMAIL_ENABLED = False
-EMAIL_SENDER = os.environ.get('EMAIL_SENDER', '')
-EMAIL_PASSWORD = os.environ.get('EMAIL_PASSWORD', '')
-EMAIL_RECIPIENT = os.environ.get('EMAIL_RECIPIENT', '')
-
-# AI Analysis settings
-AI_ENABLED = True  # Set to False to disable AI analysis
-AI_ANALYSIS_INTERVAL = 6  # Run AI analysis every N cycles (6 ciclos = ~15 minutos)
+cash_balance = 23679.72
 
 # ============================================
-# ANTI-RATE-LIMITING CONFIG
-# ============================================
-DELAY_BETWEEN_TICKERS = 5
-DELAY_BETWEEN_CYCLES = 120
-MAX_RETRIES = 3
-RETRY_DELAY = 30
-
-# ============================================
-# AI ANALYSIS FUNCTIONS
+# MAIN BOT CLASS
 # ============================================
 
-def get_ai_market_insight():
-    """Get market insight from Groq AI"""
-    prompt = f"""You are a professional stock market analyst. Provide a brief analysis of the current market situation for TSX stocks.
-    Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-    
-    Please provide:
-    1. A general market sentiment (Bullish/Bearish/Neutral)
-    2. One key insight for today's trading
-    3. A cautionary note for traders
-    
-    Keep it concise, maximum 3 sentences."""
-    
-    try:
-        completion = client.chat.completions.create(
-            model="openai/gpt-oss-120b",  # or "mixtral-8x7b-32768" for faster response
-            messages=[
-                {"role": "system", "content": "You are a professional stock market analyst providing concise, accurate insights."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_completion_tokens=300,
-            top_p=1,
-            stream=False  # False para respuesta completa
-        )
-        
-        return completion.choices[0].message.content
-        
-    except Exception as e:
-        print(f"❌ AI Analysis Error: {e}")
+class DipTideBot:
+    def __init__(self):
+        self.finnhub_key = FINNHUB_API_KEY
+        self.groq_key = GROQ_API_KEY
+        self.base_url = "https://finnhub.io/api/v1"
+        self.cache = {}
+        self.portfolio = portfolio
+        self.cash = cash_balance
+        self.daily_pnl = 0
+        self.weekly_pnl = 0
+        self.trades_log = []
+
+    # ---------- LIVE DATA FROM FINNHUB ----------
+    def get_quote(self, symbol):
+        url = f"{self.base_url}/quote"
+        params = {'symbol': symbol, 'token': self.finnhub_key}
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            data = r.json()
+            if 'c' in data and data['c'] > 0:
+                return {
+                    'symbol': symbol,
+                    'price': data['c'],
+                    'change': data['d'],
+                    'change_pct': data['dp'],
+                    'high': data['h'],
+                    'low': data['l'],
+                    'open': data['o'],
+                    'prev_close': data['pc'],
+                    'timestamp': datetime.now()
+                }
+        except Exception as e:
+            print(f"Finnhub error for {symbol}: {e}")
         return None
 
-def analyze_stock_with_ai(symbol, price, change, historical_data):
-    """Get AI analysis for a specific stock"""
-    
-    # Crear resumen de datos históricos
-    recent_prices = historical_data['Close'].tail(10).tolist() if not historical_data.empty else []
-    recent_changes = historical_data['Close'].pct_change().tail(10).tolist() if not historical_data.empty else []
-    
-    prompt = f"""Analyze this stock:
-    
-    Symbol: {symbol}
-    Current Price: ${price:.2f}
-    Daily Change: {change:+.2f}%
-    
-    Recent prices (last 10 periods): {[f'${p:.2f}' for p in recent_prices]}
-    
-    Based on this data, provide:
-    1. A BUY/SELL/HOLD recommendation
-    2. Confidence level (1-10)
-    3. Brief reasoning (1 sentence)
-    
-    Format: RECOMMENDATION|CONFIDENCE|REASONING"""
-    
-    try:
-        completion = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[
-                {"role": "system", "content": "You are a technical analyst. Provide stock recommendations based on price action."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.5,
-            max_completion_tokens=150,
-            stream=False
-        )
-        
-        result = completion.choices[0].message.content
-        parts = result.split('|')
-        
-        if len(parts) == 3:
-            return {
-                'recommendation': parts[0].strip(),
-                'confidence': parts[1].strip(),
-                'reasoning': parts[2].strip()
-            }
-        else:
+    def get_yahoo_quote(self, symbol):
+        try:
+            ticker = yf.Ticker(symbol)
+            data = ticker.history(period="1d")
+            if not data.empty:
+                price = data['Close'].iloc[-1]
+                return {'symbol': symbol, 'price': price, 'source': 'yahoo'}
+        except:
+            pass
+        return None
+
+    def get_price(self, symbol):
+        quote = self.get_quote(symbol)
+        if quote:
+            return quote['price']
+        yq = self.get_yahoo_quote(symbol)
+        if yq:
+            return yq['price']
+        if symbol in self.cache:
+            return self.cache[symbol]
+        return None
+
+    # ---------- TECHNICAL INDICATORS ----------
+    def get_historical(self, symbol, period="3mo"):
+        try:
+            ticker = yf.Ticker(symbol)
+            df = ticker.history(period=period)
+            return df
+        except:
             return None
-            
-    except Exception as e:
-        print(f"❌ Stock AI Analysis Error: {e}")
-        return None
 
-def stream_ai_analysis(prompt):
-    """Stream AI response in real-time (like your example)"""
-    try:
-        completion = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[
-                {"role": "system", "content": "You are a helpful trading assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=1,
-            max_completion_tokens=8192,
-            top_p=1,
-            reasoning_effort="medium",
-            stream=True,
-            stop=None
-        )
+    def calculate_rsi(self, df, period=14):
+        if df is None or len(df) < period:
+            return 50
+        delta = df['Close'].diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.iloc[-1]
 
-        print("\n🤖 AI Assistant: ", end="")
-        full_response = ""
-        for chunk in completion:
-            content = chunk.choices[0].delta.content or ""
-            print(content, end="", flush=True)
-            full_response += content
-        print("\n")
-        
-        return full_response
-        
-    except Exception as e:
-        print(f"❌ AI Stream Error: {e}")
-        return None
+    def calculate_adx(self, df, period=14):
+        if df is None or len(df) < period*2:
+            return 20
+        high = df['High']
+        low = df['Low']
+        close = df['Close']
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean()
+        up = high - high.shift()
+        down = low.shift() - low
+        plus_dm = (up > down) & (up > 0)
+        minus_dm = (down > up) & (down > 0)
+        plus_di = 100 * (plus_dm.rolling(window=period).sum() / atr)
+        minus_di = 100 * (minus_dm.rolling(window=period).sum() / atr)
+        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+        adx = dx.rolling(window=period).mean()
+        return adx.iloc[-1] if not adx.empty else 20
 
-# ============================================
-# CORE FUNCTIONS (originales modificadas)
-# ============================================
+    def get_moving_averages(self, df):
+        if df is None or len(df) < sma_long:
+            return {}
+        close = df['Close']
+        sma20 = close.rolling(sma_short).mean().iloc[-1]
+        sma50 = close.rolling(sma_medium).mean().iloc[-1]
+        sma200 = close.rolling(sma_long).mean().iloc[-1]
+        return {'sma20': sma20, 'sma50': sma50, 'sma200': sma200}
 
-def send_alert(message):
-    """Send email alert (if configured)"""
-    print(f"🔔 {message}")
-    
-    if EMAIL_ENABLED and EMAIL_SENDER and EMAIL_PASSWORD:
-        try:
-            msg = MIMEText(message)
-            msg['Subject'] = 'DIP & TIDE ALERT'
-            msg['From'] = EMAIL_SENDER
-            msg['To'] = EMAIL_RECIPIENT
-            
-            server = smtplib.SMTP('smtp.gmail.com', 587)
-            server.starttls()
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.send_message(msg)
-            server.quit()
-            print("  📧 Email sent")
-        except Exception as e:
-            print(f"  ❌ Email failed: {e}")
+    def get_support_resistance(self, df):
+        if df is None or len(df) < support_resistance_lookback:
+            return {}
+        high = df['High'].iloc[-support_resistance_lookback:].max()
+        low = df['Low'].iloc[-support_resistance_lookback:].min()
+        return {'resistance': high, 'support': low}
 
-def get_price_with_retry(symbol, retries=0):
-    """Get price with retry logic for rate limiting"""
-    try:
-        ticker = yf.Ticker(symbol)
-        time.sleep(random.uniform(1, 3))
-        hist = ticker.history(period='1d', interval='5m')
-        
-        if hist.empty:
-            hist = ticker.history(period='1d', interval='30m')
-            
-        return hist
-        
-    except Exception as e:
-        error_str = str(e)
-        if "Too Many Requests" in error_str and retries < MAX_RETRIES:
-            wait_time = RETRY_DELAY * (retries + 1)
-            print(f"  ⏳ Rate limited on {symbol}. Waiting {wait_time}s...")
-            time.sleep(wait_time)
-            return get_price_with_retry(symbol, retries + 1)
-        else:
-            raise e
-
-def check_prices(cycle_number):
-    """Check current prices for all symbols with AI analysis"""
-    print(f"\n📊 Checking prices at {datetime.now().strftime('%H:%M:%S')}")
-    
-    for i, (symbol, levels) in enumerate(WATCHLIST.items()):
-        try:
-            if i > 0:
-                time.sleep(DELAY_BETWEEN_TICKERS)
-            
-            print(f"  🔍 Fetching {symbol}...")
-            hist = get_price_with_retry(symbol)
-            
-            if not hist.empty:
-                price = hist['Close'].iloc[-1]
-                open_price = hist['Close'].iloc[0] if len(hist) > 1 else price
-                change = ((price - open_price) / open_price) * 100
-                
-                print(f"  ✅ {symbol}: ${price:.2f} ({change:+.2f}%)")
-                
-                # AI Analysis for this stock (every 3 cycles)
-                if AI_ENABLED and cycle_number % 3 == 0:
-                    ai_analysis = analyze_stock_with_ai(symbol, price, change, hist)
-                    if ai_analysis:
-                        print(f"  🤖 AI: {ai_analysis['recommendation']} (Confidence: {ai_analysis['confidence']}/10)")
-                        print(f"     💡 {ai_analysis['reasoning']}")
-                
-                # Check buy zones
-                if 'buy' in levels and price <= levels['buy'] * 1.01:
-                    msg = f"✅ BUY ZONE: {symbol} at ${price:.2f} (target ${levels['buy']:.2f})"
-                    send_alert(msg)
-                
-                # Check sell zones
-                if 'sell' in levels:
-                    if isinstance(levels['sell'], list):
-                        for target in levels['sell']:
-                            if price >= target * 0.99:
-                                msg = f"💰 SELL TARGET: {symbol} at ${price:.2f} (target ${target:.2f})"
-                                send_alert(msg)
-                    elif price >= levels['sell'] * 0.99:
-                        msg = f"💰 SELL ZONE: {symbol} at ${price:.2f} (target ${levels['sell']:.2f})"
-                        send_alert(msg)
-                
-                # Check stop loss
-                if 'stop' in levels and price <= levels['stop']:
-                    msg = f"🚨 STOP LOSS: {symbol} at ${price:.2f} (stop ${levels['stop']:.2f})"
-                    send_alert(msg)
+    # ---------- SECTOR STRENGTH ----------
+    def get_sector_strength(self):
+        sector_etfs = {
+            'MATERIALS': 'XMA.TO',
+            'ENERGY': 'XEG.TO',
+            'GOLD': 'XGD.TO',
+            'SILVER': 'HUZ.TO',
+            'TECHNOLOGY': 'XIT.TO',
+            'FINANCIALS': 'XFN.TO',
+            'HEALTHCARE': 'XHC.TO',
+            'INDUSTRIALS': 'XIC.TO'
+        }
+        scores = {}
+        for sector, etf in sector_etfs.items():
+            price = self.get_price(etf)
+            if price is None:
+                continue
+            hist = self.get_historical(etf, period="1mo")
+            if hist is not None and len(hist) > 1:
+                ret_1m = (price / hist['Close'].iloc[0] - 1) * 100
+                scores[sector] = ret_1m
             else:
-                print(f"  ⚠️ No data for {symbol}")
-                        
-        except Exception as e:
-            print(f"  ❌ Error checking {symbol}: {e}")
+                scores[sector] = 0
+        ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+        return {sector: rank+1 for rank, (sector, _) in enumerate(ranked)}
 
-def main():
-    """Main loop with AI integration"""
-    print("\n" + "="*60)
-    print(f"🚀 DIP & TIDE BOT WITH AI STARTED at {datetime.now()}")
-    print("="*60)
-    print(f"📈 Watching {len(WATCHLIST)} symbols")
-    print(f"🤖 AI Analysis: {'ENABLED' if AI_ENABLED else 'DISABLED'}")
-    
-    # Test AI connection
-    if AI_ENABLED:
-        print("\n🔄 Testing AI connection...")
-        test = get_ai_market_insight()
-        if test:
-            print(f"✅ AI Connected: {test}")
-        else:
-            print("⚠️ AI connection failed, but bot will continue without AI")
-    
-    cycle_count = 0
-    
-    while True:
+    # ---------- TIDE SCORE (placeholder) ----------
+    def get_tide_score(self):
+        # TODO: integrate your Amador Pacific tide data
+        return -0.31
+
+    # ---------- PORTFOLIO MANAGEMENT ----------
+    def update_portfolio_prices(self):
+        total_value = self.cash
+        positions = []
+        for symbol, data in self.portfolio.items():
+            price = self.get_price(symbol)
+            if price is None:
+                print(f"  ⚠️ Could not get price for {symbol}, skipping")
+                continue
+            market_value = price * data['shares']
+            cost = data['avg_cost'] * data['shares']
+            pnl = market_value - cost
+            pnl_pct = (pnl / cost) * 100 if cost else 0
+            total_value += market_value
+            positions.append({
+                'symbol': symbol,
+                'price': price,
+                'shares': data['shares'],
+                'market_value': market_value,
+                'cost': cost,
+                'pnl': pnl,
+                'pnl_pct': pnl_pct,
+                'sector': data.get('sector', 'OTHER')
+            })
+        self.cache_prices = {p['symbol']: p['price'] for p in positions}
+        return positions, total_value
+
+    def check_alerts(self, positions):
+        alerts = []
+        for pos in positions:
+            sym = pos['symbol']
+            data = self.portfolio[sym]
+            price = pos['price']
+            if 'stop' in data and price <= data['stop']:
+                alerts.append(f"🚨 STOP LOSS: {sym} at ${price:.2f} (stop ${data['stop']:.2f})")
+            if 'trailing_stop' in data and price <= data['trailing_stop']:
+                alerts.append(f"🛡️ TRAILING STOP: {sym} at ${price:.2f} (trailing stop hit)")
+            if 'targets' in data:
+                for t in data['targets']:
+                    if price >= t * 0.98:
+                        alerts.append(f"💰 TARGET: {sym} at ${price:.2f} (target ${t:.2f})")
+            if 'prev_price' in self.cache and sym in self.cache['prev_price']:
+                prev = self.cache['prev_price'][sym]
+                change = (price - prev)/prev * 100
+                if abs(change) > 5:
+                    alerts.append(f"⚠️ UNUSUAL MOVE: {sym} {change:+.2f}%")
+        return alerts
+
+    # ---------- OPPORTUNITY SCANNER ----------
+    def scan_opportunities(self):
+        print("\n📈 SCANNING FOR OPPORTUNITIES...")
+        sector_ranks = self.get_sector_strength()
+        top_sectors = [s for s, r in sector_ranks.items() if r <= max_sector_rank]
+        print(f"Top sectors: {', '.join(top_sectors)}")
+
+        watchlist = [
+            'TECK.B', 'CNQ.TO', 'SU.TO', 'AEM.TO', 'WPM.TO', 'FM.TO', 'LUN.TO',
+            'FCX', 'NEM', 'GOLD', 'COP', 'XOM', 'RIO', 'BHP'
+        ]
+        opportunities = []
+        for sym in watchlist:
+            price = self.get_price(sym)
+            if not price:
+                continue
+            df = self.get_historical(sym)
+            if df is None:
+                continue
+            rsi = self.calculate_rsi(df)
+            ma = self.get_moving_averages(df)
+            sr = self.get_support_resistance(df)
+            sector = ('MATERIALS' if sym in ['TECK.B','FM.TO','LUN.TO','FCX','RIO','BHP'] else
+                      'ENERGY' if sym in ['CNQ.TO','SU.TO','COP','XOM'] else
+                      'GOLD' if sym in ['AEM.TO','WPM.TO','NEM','GOLD'] else 'OTHER')
+            if sector not in sector_ranks or sector_ranks[sector] > max_sector_rank:
+                continue
+            if rsi < rsi_oversold:
+                signal = 'OVERSOLD'
+                confidence = 7
+                entry = sr.get('support', price * 0.95)
+                reason = f"RSI {rsi:.1f} near support"
+            elif price > ma.get('sma50', 0) and rsi < rsi_overbought and rsi > 40:
+                signal = 'BUY'
+                confidence = 8
+                entry = price * 0.98
+                reason = f"Uptrend, RSI {rsi:.1f}"
+            else:
+                continue
+            opportunities.append({
+                'symbol': sym,
+                'price': price,
+                'signal': signal,
+                'confidence': confidence,
+                'entry_zone': round(entry,2),
+                'sector': sector,
+                'reason': reason
+            })
+        opportunities.sort(key=lambda x: x['confidence'], reverse=True)
+        return opportunities[:10]
+
+    # ---------- GROQ AI INTEGRATION ----------
+    def groq_analysis(self, prompt):
+        if not self.groq_key:
+            return "Groq API key not set."
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.groq_key}",
+            "Content-Type": "application/json"
+        }
+        data = {
+            "model": "mixtral-8x7b-32768",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.7,
+            "max_tokens": 500
+        }
         try:
-            cycle_count += 1
-            print(f"\n{'='*60}")
-            print(f"🔄 CYCLE #{cycle_count} at {datetime.now().strftime('%H:%M:%S')}")
-            print(f"{'='*60}")
-            
-            # Regular price checking
-            check_prices(cycle_count)
-            
-            # Market-wide AI analysis every AI_ANALYSIS_INTERVAL cycles
-            if AI_ENABLED and cycle_count % AI_ANALYSIS_INTERVAL == 0:
-                print("\n🤖 Running AI Market Analysis...")
-                
-                # Stream a market insight
-                prompt = f"Give me a quick market update for TSX stocks. Current time: {datetime.now().strftime('%H:%M')}"
-                stream_ai_analysis(prompt)
-            
-            # Long pause between cycles
-            next_check = datetime.fromtimestamp(time.time() + DELAY_BETWEEN_CYCLES)
-            print(f"\n⏸️  Cycle #{cycle_count} complete. Next check at: {next_check.strftime('%H:%M:%S')}")
-            time.sleep(DELAY_BETWEEN_CYCLES)
-            
-        except KeyboardInterrupt:
-            print("\n🛑 Bot stopped by user")
-            break
+            response = requests.post(url, json=data, headers=headers)
+            response.raise_for_status()
+            result = response.json()
+            return result['choices'][0]['message']['content']
         except Exception as e:
-            print(f"❌ Error in main loop: {e}")
-            time.sleep(DELAY_BETWEEN_CYCLES)
+            return f"Groq API error: {e}"
+
+    # ---------- MAIN ROUTINE ----------
+    def run_morning_routine(self):
+        print("\n" + "🚀"*40)
+        print(" DIP & TIDE MORNING ROUTINE".center(60))
+        print("🚀"*40)
+        print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+        positions, total_value = self.update_portfolio_prices()
+        print(f"\n💰 Portfolio Value: ${total_value:,.2f}")
+        print(f"💵 Cash: ${self.cash:,.2f}")
+        total_pnl = total_value - self.cash - sum(p['cost'] for p in positions)
+        print(f"📈 Total P&L: ${total_pnl:+,.2f}")
+
+        alerts = self.check_alerts(positions)
+        if alerts:
+            print("\n🔔 ALERTS:")
+            for a in alerts:
+                print(f"  {a}")
+
+        opps = self.scan_opportunities()
+        print("\n🎯 TOP OPPORTUNITIES:")
+        for i, opp in enumerate(opps, 1):
+            print(f"\n  {i}. {opp['symbol']} - {opp['signal']} (Conf: {opp['confidence']}/10)")
+            print(f"     Price: ${opp['price']:.2f} | Entry Zone: ${opp['entry_zone']:.2f}")
+            print(f"     {opp['reason']}")
+
+        print("\n" + "="*60)
+        print("✅ Morning routine complete.")
+        return positions, opps
+
+    def send_alert(self, message):
+        if email_enabled and email_sender and email_password:
+            try:
+                msg = MIMEText(message)
+                msg['Subject'] = 'DIP & TIDE Alert'
+                msg['From'] = email_sender
+                msg['To'] = email_recipient
+                server = smtplib.SMTP('smtp.gmail.com', 587)
+                server.starttls()
+                server.login(email_sender, email_password)
+                server.send_message(msg)
+                server.quit()
+            except Exception as e:
+                print(f"Email failed: {e}")
+        if telegram_enabled and telegram_bot_token and telegram_chat_id:
+            try:
+                url = f"https://api.telegram.org/bot{telegram_bot_token}/sendMessage"
+                data = {'chat_id': telegram_chat_id, 'text': message}
+                requests.post(url, data=data)
+            except:
+                pass
 
 # ============================================
-# START THE BOT
+# MAIN EXECUTION
 # ============================================
-
 if __name__ == "__main__":
-    main()
+    bot = DipTideBot()
+    bot.run_morning_routine()
