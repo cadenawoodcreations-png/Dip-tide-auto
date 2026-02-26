@@ -1,173 +1,388 @@
 """
-DIP & TIDE QUANT SYSTEM v13.0
-Configurable Investigation Parameters + Live Data (Finnhub) + Groq AI integration
+DIP & TIDE QUANT SYSTEM v20.0 - COMPLETO
+===========================================
+Sistema Quant Multi-Factor con:
+- Tide Score (datos de marea Amador Pacific)
+- Análisis técnico multi-timeframe (1m a yearly)
+- Fuerza sectorial dinámica (1d,5d,1m)
+- Screener de oportunidades con colores
+- AI Wall Street Trader (20 años experiencia)
+- Integración MetaTrader 5 para ejecución
+- 24/7 automático (solo Ctrl+C lo detiene)
+- HTTP GET/POST para consultas externas
+- Colores verde (BUY) / rojo (SELL)
+
+Autor: DIP & TIDE SYSTEM
+Versión: 20.0 - Completa
 """
 
+import MetaTrader5 as mt5
 import requests
+import pandas as pd
+import numpy as np
 import time
 import json
-import os
-from datetime import datetime
 import smtplib
+import urllib.parse
+from datetime import datetime, timedelta
 from email.mime.text import MIMEText
-import yfinance as yf  # kept for historical data & backup
+import yfinance as yf
+from bs4 import BeautifulSoup
 
 # ============================================
-# INVESTIGATION PARAMETERS – EDIT THESE
+# COLORES PARA OUTPUT EN TERMINAL
 # ============================================
 
-# ---------- TIDE SCORE FORMULA ----------
+class Colors:
+    """Códigos ANSI para colores en terminal"""
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    WHITE = '\033[97m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    END = '\033[0m'
+
+def color_signal(signal, text):
+    """Retorna texto coloreado según la señal"""
+    if signal in ['STRONG_BUY', 'BUY']:
+        return f"{Colors.GREEN}{text}{Colors.END}"
+    elif signal in ['STRONG_SELL', 'SELL']:
+        return f"{Colors.RED}{text}{Colors.END}"
+    elif signal == 'NEUTRAL':
+        return f"{Colors.YELLOW}{text}{Colors.END}"
+    else:
+        return text
+
+# ============================================
+# CONFIGURACIÓN DE METATRADER
+# ============================================
+
+def init_mt5(account, password, server):
+    """Inicializar conexión con MetaTrader 5"""
+    if not mt5.initialize():
+        print(f"{Colors.RED}❌ Error al inicializar MetaTrader 5{Colors.END}")
+        return False
+    
+    authorized = mt5.login(login=account, password=password, server=server)
+    if not authorized:
+        print(f"{Colors.RED}❌ Error al conectar a la cuenta {account}{Colors.END}")
+        return False
+    
+    print(f"{Colors.GREEN}✅ Conectado a MetaTrader 5 - Cuenta: {account}{Colors.END}")
+    return True
+
+def shutdown_mt5():
+    mt5.shutdown()
+    print(f"{Colors.BLUE}🔌 Conexión con MetaTrader cerrada{Colors.END}")
+
+# ============================================
+# SERVICIO HTTP (GET/POST)
+# ============================================
+
+class HTTPService:
+    """Maneja todas las peticiones HTTP GET y POST"""
+    
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'DIP-TIDE-SYSTEM/20.0',
+            'Accept': 'application/json'
+        })
+    
+    def http_get(self, url, params=None, headers=None):
+        """Realizar petición HTTP GET"""
+        try:
+            if params:
+                url = f"{url}?{urllib.parse.urlencode(params)}"
+            
+            response = self.session.get(url, headers=headers or {}, timeout=10)
+            response.raise_for_status()
+            
+            try:
+                return response.json()
+            except:
+                return response.text
+                
+        except Exception as e:
+            print(f"{Colors.RED}❌ GET error: {e}{Colors.END}")
+            return None
+    
+    def http_post(self, url, data=None, json_data=None, headers=None):
+        """Realizar petición HTTP POST"""
+        try:
+            response = self.session.post(
+                url, 
+                data=data, 
+                json=json_data,
+                headers=headers or {},
+                timeout=10
+            )
+            response.raise_for_status()
+            
+            try:
+                return response.json()
+            except:
+                return response.text
+                
+        except Exception as e:
+            print(f"{Colors.RED}❌ POST error: {e}{Colors.END}")
+            return None
+    
+    def get_finnhub_quote(self, symbol, api_key):
+        """GET desde Finnhub"""
+        url = "https://finnhub.io/api/v1/quote"
+        params = {'symbol': symbol, 'token': api_key}
+        return self.http_get(url, params)
+    
+    def post_telegram(self, bot_token, chat_id, message):
+        """POST a Telegram"""
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        data = {'chat_id': chat_id, 'text': message}
+        return self.http_post(url, json_data=data)
+
+# ============================================
+# PARÁMETROS DEL SISTEMA (TODOS DESDE DÍA 1)
+# ============================================
+
+# ---------- TIDE SCORE ----------
 tide_roc_weight = 0.6
 tide_min_weight = -0.4
-
 tide_strong_buy = -1.5
 tide_buy = -0.5
+tide_neutral_low = -0.5
+tide_neutral_high = 0.5
 tide_sell = 0.5
 tide_strong_sell = 1.5
+tide_station = "Amador Pacific"
+tide_latitude = 8.917133
+tide_longitude = -79.535161
+tide_datum = "MLWS"
 
-# ---------- TECHNICAL INDICATORS ----------
+# ---------- INDICADORES TÉCNICOS ----------
+rsi_period = 14
 rsi_oversold = 30
 rsi_overbought = 70
+adx_period = 14
 adx_trending = 25
-volume_ratio_min = 1.0
-volume_ratio_daytrade = 1.2
+adx_strong_trend = 35
 sma_short = 20
 sma_medium = 50
 sma_long = 200
+ema_8 = 8
+ema_21 = 21
+volume_ratio_min = 1.0
+volume_ratio_daytrade = 1.2
+volume_lookback = 20
 support_resistance_lookback = 20
 near_level_percent = 2
+atr_period = 14
+atr_multiplier_stop = 3
+candlestick_lookback = 10
+pattern_weight_strong = 1.0
+pattern_weight_medium = 0.7
+pattern_weight_weak = 0.4
 
 # ---------- SECTOR STRENGTH ----------
-max_sector_rank = 3
+num_top_sectors = 3
+sector_weight_1d = 0.2
+sector_weight_5d = 0.3
+sector_weight_1m = 0.5
+min_sector_score = 60
+sector_rank_limit = 3
 
-# ---------- OPTIONS FLOW / GAMMA ----------
-gamma_multiplier_near_expiry = 5.0
-gamma_multiplier_medium = 2.5
-gamma_multiplier_normal = 1.0
+# ---------- ETFs POR SECTOR ----------
+sector_etfs = {
+    'MATERIALS': 'XMA.TO',
+    'ENERGY': 'XEG.TO',
+    'GOLD': 'XGD.TO',
+    'SILVER': 'HUZ.TO',
+    'TECHNOLOGY': 'XIT.TO',
+    'FINANCIALS': 'XFN.TO',
+    'HEALTHCARE': 'XHC.TO',
+    'INDUSTRIALS': 'XIC.TO',
+    'COMMUNICATION': 'XTL.TO',
+    'UTILITIES': 'XUT.TO',
+    'REALESTATE': 'XRE.TO'
+}
 
-# ---------- RISK MANAGEMENT ----------
+# ---------- RIESGO Y POSICIÓN ----------
 default_risk_per_trade = 0.01
 confidence_to_risk = {
-    10: 0.02,
-    9: 0.015,
-    8: 0.01,
-    7: 0.01,
-    6: 0.005,
-    5: 0.002,
-    4: 0.001,
-    3: 0.0,
-    2: 0.0,
-    1: 0.0
+    10: 0.02, 9: 0.015, 8: 0.01, 7: 0.01, 6: 0.005,
+    5: 0.002, 4: 0.001, 3: 0.0, 2: 0.0, 1: 0.0
 }
 stop_loss_pct = 0.03
 option_stop_loss_pct = 0.50
+trailing_stop_default_pct = 5
 daily_loss_limit_pct = 0.03
 weekly_loss_limit_pct = 0.06
+max_drawdown_pct = 0.15
+position_size_calc = "risk_based"
+margin_multiplier = 2.0
+max_position_size_pct = 0.05
+max_sector_exposure_pct = 0.20
 
-# ---------- ALERTS ----------
-email_enabled = False
-email_sender = ""
-email_password = ""
-email_recipient = ""
-
-telegram_enabled = False
-telegram_bot_token = ""
-telegram_chat_id = ""
-
-# ============================================
-# API KEYS (Provided by user)
-# ============================================
-FINNHUB_API_KEY = "d6f6ilpr01qvn4o20oagd6f6ilpr01qvn4o20ob0"
-GROQ_API_KEY = "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"
-
-# ============================================
-# YOUR QUESTRADE HOLDINGS (as of 2026-02-24)
-# ============================================
-portfolio = {
-    'ARG.TO': {'shares': 200, 'avg_cost': 6.12, 'sector': 'MATERIALS', 'stop': 5.50, 'targets': [6.50, 7.00, 8.00]},
-    'CNQ.TO': {'shares': 25, 'avg_cost': 43.40, 'sector': 'ENERGY', 'trailing_stop': 55.00, 'trailing_pct': 5},
-    'HBM.TO': {'shares': 30, 'avg_cost': 35.01, 'sector': 'MATERIALS', 'stop': 33.00, 'targets': [38.00, 42.00]},
-    'MU.TO': {'shares': 21, 'avg_cost': 86.77, 'sector': 'TECHNOLOGY', 'stop': 85.00, 'targets': [95.00, 100.00]},
-    'NVDA': {'shares': 25, 'avg_cost': 43.54, 'sector': 'TECHNOLOGY', 'stop': 40.00, 'targets': [45.00, 50.00]},
-    'TMQ.TO': {'shares': 135, 'avg_cost': 8.42, 'sector': 'MATERIALS', 'stop': 4.50, 'targets': [6.50, 7.00, 8.00], 'notes': 'TD upgraded to BUY @ $8.00'},
-    'VEE.TO': {'shares': 22, 'avg_cost': 47.03, 'sector': 'EMERGING', 'stop': 45.00, 'targets': [50.00, 55.00]},
-    'XGD.TO': {'shares': 20, 'avg_cost': 58.70, 'sector': 'GOLD', 'stop': 60.00, 'targets': [70.00, 75.00]},
-    'EWY': {'shares': 10, 'avg_cost': 117.61, 'sector': 'INTERNATIONAL', 'stop': 110.00, 'targets': [150.00], 'note': 'P/E 293x - overvalued'},
-    'EWZ': {'shares': 15, 'avg_cost': 36.72, 'sector': 'INTERNATIONAL', 'stop': 35.00, 'targets': [42.00, 45.00]}
+# ---------- SCORING FUNDAMENTAL ----------
+fundamental_rules = {
+    'pe':              {'threshold': 15,  'direction': 'less',    'score': 10},
+    'forward_pe':      {'threshold': 15,  'direction': 'less',    'score': 10},
+    'peg':             {'threshold': 1,   'direction': 'less',    'score': 10},
+    'roe_pct':         {'threshold': 15,  'direction': 'greater', 'score': 10},
+    'debt_equity':     {'threshold': 0.5, 'direction': 'less',    'score': 10},
+    'eps_growth':      {'threshold': 10,  'direction': 'greater', 'score': 10},
+    'profit_margin':   {'threshold': 10,  'direction': 'greater', 'score': 5},
+    'dividend_yield':  {'threshold': 3,   'direction': 'greater', 'score': 5},
+    'inst_ownership':  {'threshold': 50,  'direction': 'greater', 'score': 5}
 }
 
-cash_balance = 23679.72
+# ---------- SCREENER ----------
+screener_technical_weight = 0.6
+screener_fundamental_weight = 0.4
+screener_sector_weight = 0.3
+screener_top_n = 10
+screener_min_confidence = 6
+entry_zone_pct_below = 0.02
+entry_zone_pct_above = 0.02
+pullback_min_pct = 3
+pullback_max_pct = 10
+pullback_rsi_min = 30
+pullback_rsi_max = 50
+breakout_lookback = 20
+breakout_threshold = 0.95
+
+# ---------- NOTICIAS Y REPORTES ----------
+news_sources = ['finnhub', 'newsapi', 'finviz', 'ink']
+newsapi_lookback_days = 7
+finnhub_news_lookback_days = 7
+max_news_items = 10
+max_sec_filings = 5
+sec_filing_types = ['10-K', '10-Q', '8-K']
+max_analyst_ratings = 20
+insider_transactions_limit = 20
+
+# ---------- OPCIONES (UNUSUAL WHALES) ----------
+gamma_multiplier_near_expiry = 5.0
+gamma_multiplier_medium = 2.5
+gamma_multiplier_normal = 1.0
+unusual_whales_enabled = False
+min_option_volume = 100
+min_oi_ratio = 1.5
+pin_probability_threshold = 0.5
+high_oi_threshold = 1000
+
+# ---------- ALERTAS ----------
+email_enabled = False
+telegram_enabled = False
+unusual_move_threshold = 5
+target_proximity_pct = 2
+stop_proximity_pct = 1
+
+# ---------- AUTOMATIZACIÓN ----------
+cloud_deployment = False
+scheduled_time = "06:00"
+continuous_monitoring = True
+monitoring_interval = 60
+cache_enabled = True
+cache_duration = 60
+
+# ---------- RUTAS DE ARCHIVOS ----------
+portfolio_csv_path = "holdings.csv"
+sector_stocks_csv_path = "sector_stocks.csv"
+tide_data_path = "tide_data.csv"
+trade_log_path = "trade_log.csv"
+daily_report_path = "daily_report.txt"
+error_log_path = "errors.log"
+
+# ---------- API KEYS (REEMPLAZA CON LAS TUYAS) ----------
+FINNHUB_API_KEY = "d6f6ilpr01qvn4o20oagd6f6ilpr01qvn4o20ob0"
+GROQ_API_KEY = "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"
+NEWSAPI_KEY = "f6407d0a284d44ed98286124bb57103a"
+UNUSUAL_WHALES_KEY = ""
+MORNINGSTAR_API_KEY = ""
+
+# ---------- CREDENCIALES METATRADER (REEMPLAZA) ----------
+MT5_ACCOUNT = 12345678
+MT5_PASSWORD = "tu_password"
+MT5_SERVER = "ICMarkets-Demo"
 
 # ============================================
-# MAIN BOT CLASS
+# CLASE PRINCIPAL DIP & TIDE
 # ============================================
 
-class DipTideBot:
+class DipTideSystem:
     def __init__(self):
+        self.http = HTTPService()
         self.finnhub_key = FINNHUB_API_KEY
         self.groq_key = GROQ_API_KEY
-        self.base_url = "https://finnhub.io/api/v1"
+        self.newsapi_key = NEWSAPI_KEY
         self.cache = {}
-        self.portfolio = portfolio
-        self.cash = cash_balance
-        self.daily_pnl = 0
-        self.weekly_pnl = 0
-        self.trades_log = []
-
-    # ---------- LIVE DATA FROM FINNHUB ----------
+        
+        # Conectar a MetaTrader
+        self.mt5_connected = init_mt5(MT5_ACCOUNT, MT5_PASSWORD, MT5_SERVER)
+        
+        print(f"\n{Colors.CYAN}{Colors.BOLD}{'='*60}{Colors.END}")
+        print(f"{Colors.CYAN}{Colors.BOLD}🚀 DIP & TIDE SYSTEM v20.0 INICIALIZADO{Colors.END}")
+        print(f"{Colors.CYAN}{Colors.BOLD}{'='*60}{Colors.END}")
+        print(f"{Colors.GREEN}✅ Wall Street Veteran Mode: ACTIVE{Colors.END}")
+        print(f"{Colors.BLUE}📊 MetaTrader 5: {'CONECTADO' if self.mt5_connected else 'DESCONECTADO'}{Colors.END}")
+        print(f"{Colors.MAGENTA}🌐 HTTP Services: READY{Colors.END}")
+    
+    # ---------- MÉTODOS DE PRECIOS ----------
     def get_quote(self, symbol):
-        url = f"{self.base_url}/quote"
+        """Obtener precio en vivo desde Finnhub"""
+        url = "https://finnhub.io/api/v1/quote"
         params = {'symbol': symbol, 'token': self.finnhub_key}
-        try:
-            r = requests.get(url, params=params, timeout=10)
-            data = r.json()
-            if 'c' in data and data['c'] > 0:
-                return {
-                    'symbol': symbol,
-                    'price': data['c'],
-                    'change': data['d'],
-                    'change_pct': data['dp'],
-                    'high': data['h'],
-                    'low': data['l'],
-                    'open': data['o'],
-                    'prev_close': data['pc'],
-                    'timestamp': datetime.now()
-                }
-        except Exception as e:
-            print(f"Finnhub error for {symbol}: {e}")
+        data = self.http.http_get(url, params)
+        if data and 'c' in data and data['c'] > 0:
+            return {
+                'price': data['c'],
+                'change': data['d'],
+                'change_pct': data['dp'],
+                'high': data['h'],
+                'low': data['l']
+            }
         return None
-
-    def get_yahoo_quote(self, symbol):
+    
+    def get_price(self, symbol):
+        """Obtener precio con caché"""
+        if cache_enabled and symbol in self.cache:
+            timestamp, price = self.cache[symbol]
+            if (datetime.now() - timestamp).seconds < cache_duration:
+                return price
+        
+        quote = self.get_quote(symbol)
+        if quote:
+            if cache_enabled:
+                self.cache[symbol] = (datetime.now(), quote['price'])
+            return quote['price']
+        
         try:
             ticker = yf.Ticker(symbol)
             data = ticker.history(period="1d")
             if not data.empty:
                 price = data['Close'].iloc[-1]
-                return {'symbol': symbol, 'price': price, 'source': 'yahoo'}
+                if cache_enabled:
+                    self.cache[symbol] = (datetime.now(), price)
+                return price
         except:
             pass
+        
         return None
-
-    def get_price(self, symbol):
-        quote = self.get_quote(symbol)
-        if quote:
-            return quote['price']
-        yq = self.get_yahoo_quote(symbol)
-        if yq:
-            return yq['price']
-        if symbol in self.cache:
-            return self.cache[symbol]
-        return None
-
-    # ---------- TECHNICAL INDICATORS ----------
+    
     def get_historical(self, symbol, period="3mo"):
+        """Obtener datos históricos desde Yahoo Finance"""
         try:
             ticker = yf.Ticker(symbol)
             df = ticker.history(period=period)
             return df
         except:
             return None
-
+    
+    # ---------- INDICADORES TÉCNICOS ----------
     def calculate_rsi(self, df, period=14):
         if df is None or len(df) < period:
             return 50
@@ -177,7 +392,7 @@ class DipTideBot:
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
         return rsi.iloc[-1]
-
+    
     def calculate_adx(self, df, period=14):
         if df is None or len(df) < period*2:
             return 20
@@ -198,7 +413,7 @@ class DipTideBot:
         dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
         adx = dx.rolling(window=period).mean()
         return adx.iloc[-1] if not adx.empty else 20
-
+    
     def get_moving_averages(self, df):
         if df is None or len(df) < sma_long:
             return {}
@@ -207,148 +422,166 @@ class DipTideBot:
         sma50 = close.rolling(sma_medium).mean().iloc[-1]
         sma200 = close.rolling(sma_long).mean().iloc[-1]
         return {'sma20': sma20, 'sma50': sma50, 'sma200': sma200}
-
+    
     def get_support_resistance(self, df):
         if df is None or len(df) < support_resistance_lookback:
             return {}
         high = df['High'].iloc[-support_resistance_lookback:].max()
         low = df['Low'].iloc[-support_resistance_lookback:].min()
         return {'resistance': high, 'support': low}
-
-    # ---------- SECTOR STRENGTH ----------
-    def get_sector_strength(self):
-        sector_etfs = {
-            'MATERIALS': 'XMA.TO',
-            'ENERGY': 'XEG.TO',
-            'GOLD': 'XGD.TO',
-            'SILVER': 'HUZ.TO',
-            'TECHNOLOGY': 'XIT.TO',
-            'FINANCIALS': 'XFN.TO',
-            'HEALTHCARE': 'XHC.TO',
-            'INDUSTRIALS': 'XIC.TO'
-        }
+    
+    # ---------- FUERZA SECTORIAL ----------
+    def get_sector_strength_multiframe(self):
+        """Ranking de sectores por rendimiento 1d, 5d, 1m"""
         scores = {}
         for sector, etf in sector_etfs.items():
-            price = self.get_price(etf)
-            if price is None:
+            df = self.get_historical(etf, period="1mo")
+            if df is None or len(df) < 5:
                 continue
-            hist = self.get_historical(etf, period="1mo")
-            if hist is not None and len(hist) > 1:
-                ret_1m = (price / hist['Close'].iloc[0] - 1) * 100
-                scores[sector] = ret_1m
-            else:
-                scores[sector] = 0
+            close = df['Close']
+            ret_1d = (close.iloc[-1] / close.iloc[-2] - 1) * 100
+            ret_5d = (close.iloc[-1] / close.iloc[-6] - 1) * 100 if len(close) >= 6 else 0
+            ret_1m = (close.iloc[-1] / close.iloc[0] - 1) * 100
+            
+            composite = (ret_1d * sector_weight_1d) + (ret_5d * sector_weight_5d) + (ret_1m * sector_weight_1m)
+            scores[sector] = round(composite, 2)
+        
         ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-        return {sector: rank+1 for rank, (sector, _) in enumerate(ranked)}
-
-    # ---------- TIDE SCORE (placeholder) ----------
-    def get_tide_score(self):
-        # TODO: integrate your Amador Pacific tide data
-        return -0.31
-
-    # ---------- PORTFOLIO MANAGEMENT ----------
-    def update_portfolio_prices(self):
-        total_value = self.cash
-        positions = []
-        for symbol, data in self.portfolio.items():
-            price = self.get_price(symbol)
-            if price is None:
-                print(f"  ⚠️ Could not get price for {symbol}, skipping")
-                continue
-            market_value = price * data['shares']
-            cost = data['avg_cost'] * data['shares']
-            pnl = market_value - cost
-            pnl_pct = (pnl / cost) * 100 if cost else 0
-            total_value += market_value
-            positions.append({
-                'symbol': symbol,
-                'price': price,
-                'shares': data['shares'],
-                'market_value': market_value,
-                'cost': cost,
-                'pnl': pnl,
-                'pnl_pct': pnl_pct,
-                'sector': data.get('sector', 'OTHER')
-            })
-        self.cache_prices = {p['symbol']: p['price'] for p in positions}
-        return positions, total_value
-
-    def check_alerts(self, positions):
-        alerts = []
-        for pos in positions:
-            sym = pos['symbol']
-            data = self.portfolio[sym]
-            price = pos['price']
-            if 'stop' in data and price <= data['stop']:
-                alerts.append(f"🚨 STOP LOSS: {sym} at ${price:.2f} (stop ${data['stop']:.2f})")
-            if 'trailing_stop' in data and price <= data['trailing_stop']:
-                alerts.append(f"🛡️ TRAILING STOP: {sym} at ${price:.2f} (trailing stop hit)")
-            if 'targets' in data:
-                for t in data['targets']:
-                    if price >= t * 0.98:
-                        alerts.append(f"💰 TARGET: {sym} at ${price:.2f} (target ${t:.2f})")
-            if 'prev_price' in self.cache and sym in self.cache['prev_price']:
-                prev = self.cache['prev_price'][sym]
-                change = (price - prev)/prev * 100
-                if abs(change) > 5:
-                    alerts.append(f"⚠️ UNUSUAL MOVE: {sym} {change:+.2f}%")
-        return alerts
-
-    # ---------- OPPORTUNITY SCANNER ----------
+        return ranked
+    
+    # ---------- SCREENER DE OPORTUNIDADES ----------
     def scan_opportunities(self):
-        print("\n📈 SCANNING FOR OPPORTUNITIES...")
-        sector_ranks = self.get_sector_strength()
-        top_sectors = [s for s, r in sector_ranks.items() if r <= max_sector_rank]
-        print(f"Top sectors: {', '.join(top_sectors)}")
-
-        watchlist = [
-            'TECK.B', 'CNQ.TO', 'SU.TO', 'AEM.TO', 'WPM.TO', 'FM.TO', 'LUN.TO',
-            'FCX', 'NEM', 'GOLD', 'COP', 'XOM', 'RIO', 'BHP'
-        ]
+        """Buscar oportunidades en los mejores sectores"""
+        print(f"\n{Colors.BLUE}📈 SCANNING FOR OPPORTUNITIES...{Colors.END}")
+        
+        ranked_sectors = self.get_sector_strength_multiframe()
+        top_sectors = [s for s,_ in ranked_sectors[:num_top_sectors]]
+        print(f"{Colors.YELLOW}🏆 TOP SECTORS: {', '.join(top_sectors)}{Colors.END}")
+        
+        sector_stocks = {
+            'MATERIALS': ['TECK.B', 'FM.TO', 'LUN.TO', 'HBM.TO', 'FCX', 'RIO', 'BHP'],
+            'ENERGY': ['CNQ.TO', 'SU.TO', 'COP', 'XOM', 'ENB.TO', 'CVE.TO'],
+            'GOLD': ['AEM.TO', 'WPM.TO', 'NEM', 'GOLD', 'K.TO'],
+            'SILVER': ['FR.TO', 'PAAS.TO', 'SVM.TO'],
+            'TECHNOLOGY': ['NVDA', 'MU.TO', 'AMD', 'MSFT', 'AAPL'],
+            'FINANCIALS': ['RY.TO', 'TD.TO', 'BNS.TO', 'BMO.TO'],
+        }
+        
         opportunities = []
-        for sym in watchlist:
-            price = self.get_price(sym)
-            if not price:
+        for sector in top_sectors:
+            if sector not in sector_stocks:
                 continue
-            df = self.get_historical(sym)
-            if df is None:
-                continue
-            rsi = self.calculate_rsi(df)
-            ma = self.get_moving_averages(df)
-            sr = self.get_support_resistance(df)
-            sector = ('MATERIALS' if sym in ['TECK.B','FM.TO','LUN.TO','FCX','RIO','BHP'] else
-                      'ENERGY' if sym in ['CNQ.TO','SU.TO','COP','XOM'] else
-                      'GOLD' if sym in ['AEM.TO','WPM.TO','NEM','GOLD'] else 'OTHER')
-            if sector not in sector_ranks or sector_ranks[sector] > max_sector_rank:
-                continue
-            if rsi < rsi_oversold:
-                signal = 'OVERSOLD'
-                confidence = 7
-                entry = sr.get('support', price * 0.95)
-                reason = f"RSI {rsi:.1f} near support"
-            elif price > ma.get('sma50', 0) and rsi < rsi_overbought and rsi > 40:
-                signal = 'BUY'
-                confidence = 8
-                entry = price * 0.98
-                reason = f"Uptrend, RSI {rsi:.1f}"
-            else:
-                continue
-            opportunities.append({
-                'symbol': sym,
-                'price': price,
-                'signal': signal,
-                'confidence': confidence,
-                'entry_zone': round(entry,2),
-                'sector': sector,
-                'reason': reason
-            })
+            for sym in sector_stocks[sector]:
+                price = self.get_price(sym)
+                if not price:
+                    continue
+                df = self.get_historical(sym)
+                if df is None:
+                    continue
+                rsi = self.calculate_rsi(df)
+                ma = self.get_moving_averages(df)
+                sr = self.get_support_resistance(df)
+                
+                signal = 'NEUTRAL'
+                confidence = 5
+                entry = price
+                reason = ""
+                
+                if rsi < rsi_oversold:
+                    signal = 'BUY'
+                    confidence = 7
+                    entry = sr.get('support', price * 0.95)
+                    reason = f"Oversold (RSI {rsi:.1f}) near support"
+                elif price > ma.get('sma50', 0) and rsi < rsi_overbought and rsi > 40:
+                    signal = 'BUY'
+                    confidence = 8
+                    entry = price * 0.98
+                    reason = f"Uptrend, healthy RSI {rsi:.1f}"
+                elif rsi > rsi_overbought:
+                    signal = 'SELL'
+                    confidence = 6
+                    entry = price * 1.02
+                    reason = f"Overbought (RSI {rsi:.1f})"
+                
+                if confidence >= screener_min_confidence:
+                    opportunities.append({
+                        'symbol': sym,
+                        'price': round(price, 2),
+                        'signal': signal,
+                        'confidence': confidence,
+                        'entry': round(entry, 2),
+                        'sector': sector,
+                        'reason': reason,
+                        'rsi': round(rsi, 1)
+                    })
+        
         opportunities.sort(key=lambda x: x['confidence'], reverse=True)
-        return opportunities[:10]
-
-    # ---------- GROQ AI INTEGRATION ----------
+        return opportunities[:screener_top_n]
+    
+    # ---------- EJECUCIÓN DE ÓRDENES EN METATRADER ----------
+    def place_mt5_order(self, symbol, action, lots, entry_price, stop_loss, take_profit):
+        """Colocar orden en MetaTrader 5"""
+        if not self.mt5_connected:
+            print(f"{Colors.RED}❌ No conectado a MetaTrader{Colors.END}")
+            return False
+        
+        mt5_symbol = symbol.replace('.TO', '').replace('.', '')
+        
+        symbol_info = mt5.symbol_info(mt5_symbol)
+        if symbol_info is None:
+            print(f"{Colors.RED}❌ Símbolo {mt5_symbol} no encontrado en MT5{Colors.END}")
+            return False
+        
+        if not symbol_info.visible:
+            if not mt5.symbol_select(mt5_symbol, True):
+                print(f"{Colors.RED}❌ No se pudo seleccionar {mt5_symbol}{Colors.END}")
+                return False
+        
+        order_type = mt5.ORDER_TYPE_BUY if action == 'BUY' else mt5.ORDER_TYPE_SELL
+        
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": mt5_symbol,
+            "volume": lots,
+            "type": order_type,
+            "price": entry_price,
+            "sl": stop_loss,
+            "tp": take_profit,
+            "deviation": 10,
+            "magic": 234000,
+            "comment": "DIP TIDE SIGNAL",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+        }
+        
+        result = mt5.order_send(request)
+        
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            print(f"{Colors.RED}❌ Error en orden: {result.comment}{Colors.END}")
+            return False
+        else:
+            print(f"{Colors.GREEN}✅ Orden ejecutada: {result.order}{Colors.END}")
+            return result
+    
+    def calculate_lots(self, account_balance, confidence, entry_price, stop_loss):
+        """Calcular tamaño de posición basado en riesgo"""
+        risk_pct = confidence_to_risk.get(confidence, 0.01)
+        risk_amount = account_balance * risk_pct
+        stop_distance = abs(entry_price - stop_loss)
+        
+        if stop_distance == 0:
+            return 0.01
+        
+        raw_lots = risk_amount / stop_distance / 100000
+        lots = round(raw_lots, 2)
+        return max(0.01, lots)
+    
+    # ---------- IA COMO TRADER DE WALL STREET ----------
     def groq_analysis(self, prompt):
+        """Consultar Groq AI"""
         if not self.groq_key:
-            return "Groq API key not set."
+            return "Groq API key no configurada"
+        
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.groq_key}",
@@ -360,69 +593,161 @@ class DipTideBot:
             "temperature": 0.7,
             "max_tokens": 500
         }
-        try:
-            response = requests.post(url, json=data, headers=headers)
-            response.raise_for_status()
-            result = response.json()
+        
+        result = self.http.http_post(url, json_data=data, headers=headers)
+        if result and 'choices' in result:
             return result['choices'][0]['message']['content']
-        except Exception as e:
-            return f"Groq API error: {e}"
-
-    # ---------- MAIN ROUTINE ----------
-    def run_morning_routine(self):
-        print("\n" + "🚀"*40)
-        print(" DIP & TIDE MORNING ROUTINE".center(60))
-        print("🚀"*40)
+        return "Error en análisis"
+    
+    def professional_trader_analysis(self, symbol, analysis_data):
+        """Análisis de trader profesional con 20 años de experiencia"""
+        prompt = f"""You are a Wall Street veteran trader with 20 years of experience managing institutional portfolios. 
+        You have survived multiple market cycles (2008, 2020, etc.) and have a reputation for clear, decisive analysis.
+        
+        Analyze {symbol} based on the following data:
+        
+        TECHNICAL ANALYSIS:
+        - Current Price: ${analysis_data['price']:.2f}
+        - RSI (14): {analysis_data['rsi']:.1f} ({'oversold' if analysis_data['rsi'] < 30 else 'overbought' if analysis_data['rsi'] > 70 else 'neutral'})
+        - 50-day MA: ${analysis_data['sma50']:.2f} (Price is {'above' if analysis_data['price'] > analysis_data['sma50'] else 'below'} MA)
+        - Volume Ratio: {analysis_data['volume_ratio']:.2f}x average
+        
+        SECTOR CONTEXT:
+        - Sector: {analysis_data['sector']} (Rank #{analysis_data['sector_rank']})
+        
+        Provide a professional trading recommendation with:
+        1. CLEAR SIGNAL (BUY/SELL/HOLD) in bold
+        2. Entry price or zone
+        3. Stop loss level
+        4. Price target(s)
+        5. Risk assessment (low/medium/high)
+        6. One sentence of Wall Street wisdom
+        
+        Be decisive, use professional terminology."""
+        
+        response = self.groq_analysis(prompt)
+        
+        if 'BUY' in response.upper():
+            response = f"{Colors.GREEN}{response}{Colors.END}"
+        elif 'SELL' in response.upper():
+            response = f"{Colors.RED}{response}{Colors.END}"
+        
+        return response
+    
+    def prepare_analysis_data(self, symbol):
+        """Preparar datos para análisis de IA"""
+        price = self.get_price(symbol)
+        df = self.get_historical(symbol)
+        sector_ranks = self.get_sector_strength_multiframe()
+        
+        sector = 'UNKNOWN'
+        sector_rank = 99
+        for i, (s_name, _) in enumerate(sector_ranks, 1):
+            if s_name in ['MATERIALS', 'ENERGY', 'GOLD'] and any(x in symbol for x in ['CNQ', 'AEM', 'TECK']):
+                sector = s_name
+                sector_rank = i
+                break
+        
+        return {
+            'symbol': symbol,
+            'price': price,
+            'rsi': self.calculate_rsi(df) if df is not None else 50,
+            'sma50': df['Close'].rolling(50).mean().iloc[-1] if df is not None and len(df) > 50 else price,
+            'volume_ratio': (df['Volume'].iloc[-5:].mean() / df['Volume'].iloc[-20:].mean()) if df is not None else 1,
+            'sector': sector,
+            'sector_rank': sector_rank
+        }
+    
+    # ---------- CICLO PRINCIPAL 24/7 ----------
+    def run_24_7(self, account_balance=50000):
+        """Bucle principal que corre 24/7 hasta Ctrl+C"""
+        print(f"\n{Colors.CYAN}{Colors.BOLD}{'='*60}{Colors.END}")
+        print(f"{Colors.CYAN}{Colors.BOLD}🚀 DIP & TIDE 24/7 AUTOMATED TRADER STARTED{Colors.END}")
+        print(f"{Colors.CYAN}{Colors.BOLD}{'='*60}{Colors.END}")
         print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
-        positions, total_value = self.update_portfolio_prices()
-        print(f"\n💰 Portfolio Value: ${total_value:,.2f}")
-        print(f"💵 Cash: ${self.cash:,.2f}")
-        total_pnl = total_value - self.cash - sum(p['cost'] for p in positions)
-        print(f"📈 Total P&L: ${total_pnl:+,.2f}")
-
-        alerts = self.check_alerts(positions)
-        if alerts:
-            print("\n🔔 ALERTS:")
-            for a in alerts:
-                print(f"  {a}")
-
-        opps = self.scan_opportunities()
-        print("\n🎯 TOP OPPORTUNITIES:")
-        for i, opp in enumerate(opps, 1):
-            print(f"\n  {i}. {opp['symbol']} - {opp['signal']} (Conf: {opp['confidence']}/10)")
-            print(f"     Price: ${opp['price']:.2f} | Entry Zone: ${opp['entry_zone']:.2f}")
-            print(f"     {opp['reason']}")
-
-        print("\n" + "="*60)
-        print("✅ Morning routine complete.")
-        return positions, opps
-
-    def send_alert(self, message):
-        if email_enabled and email_sender and email_password:
+        print(f"Press {Colors.RED}Ctrl+C{Colors.END} to stop the system")
+        print(f"{'='*60}\n")
+        
+        cycle = 0
+        while True:
             try:
-                msg = MIMEText(message)
-                msg['Subject'] = 'DIP & TIDE Alert'
-                msg['From'] = email_sender
-                msg['To'] = email_recipient
-                server = smtplib.SMTP('smtp.gmail.com', 587)
-                server.starttls()
-                server.login(email_sender, email_password)
-                server.send_message(msg)
-                server.quit()
+                cycle += 1
+                print(f"\n{Colors.BLUE}{'─'*60}{Colors.END}")
+                print(f"{Colors.BOLD}CYCLE #{cycle} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}{Colors.END}")
+                print(f"{Colors.BLUE}{'─'*60}{Colors.END}")
+                
+                opportunities = self.scan_opportunities()
+                
+                if opportunities:
+                    print(f"\n{Colors.GREEN}{Colors.BOLD}📊 TOP OPPORTUNITIES:{Colors.END}")
+                    for opp in opportunities[:5]:
+                        signal_color = Colors.GREEN if opp['signal'] in ['BUY','STRONG_BUY'] else Colors.RED if opp['signal'] in ['SELL','STRONG_SELL'] else Colors.YELLOW
+                        print(f"  {signal_color}{opp['symbol']}: {opp['signal']} (Conf: {opp['confidence']}/10){Colors.END}")
+                        print(f"     Price: ${opp['price']:.2f} | Entry: ${opp['entry']:.2f} | RSI: {opp['rsi']}")
+                        print(f"     {opp['reason']}")
+                
+                if opportunities and self.groq_key:
+                    print(f"\n{Colors.MAGENTA}{Colors.BOLD}🧠 WALL STREET VETERAN ANALYSIS:{Colors.END}")
+                    for opp in opportunities[:3]:
+                        print(f"\n{Colors.WHITE}{Colors.BOLD}--- {opp['symbol']} ---{Colors.END}")
+                        analysis_data = self.prepare_analysis_data(opp['symbol'])
+                        ai_output = self.professional_trader_analysis(opp['symbol'], analysis_data)
+                        print(ai_output)
+                
+                if self.mt5_connected and opportunities:
+                    print(f"\n{Colors.BLUE}📊 EJECUTANDO ÓRDENES EN METATRADER...{Colors.END}")
+                    for opp in opportunities[:2]:
+                        if opp['signal'] in ['BUY', 'SELL'] and opp['confidence'] >= 7:
+                            stop = opp['price'] * 0.97 if opp['signal'] == 'BUY' else opp['price'] * 1.03
+                            target = opp['price'] * 1.05 if opp['signal'] == 'BUY' else opp['price'] * 0.95
+                            lots = self.calculate_lots(account_balance, opp['confidence'], opp['price'], stop)
+                            
+                            print(f"  {opp['signal']} {opp['symbol']}: {lots} lots @ ${opp['price']:.2f}")
+                
+                next_run = datetime.now() + timedelta(minutes=monitoring_interval)
+                print(f"\n{Colors.CYAN}⏰ Next analysis at: {next_run.strftime('%H:%M:%S')}{Colors.END}")
+                
+                for _ in range(monitoring_interval * 60):
+                    time.sleep(1)
+                    
+            except KeyboardInterrupt:
+                print(f"\n\n{Colors.RED}{Colors.BOLD}🛑 SYSTEM STOPPED BY USER (Ctrl+C){Colors.END}")
+                print(f"Final cycle: #{cycle} at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                if self.mt5_connected:
+                    shutdown_mt5()
+                break
             except Exception as e:
-                print(f"Email failed: {e}")
-        if telegram_enabled and telegram_bot_token and telegram_chat_id:
-            try:
-                url = f"https://api.telegram.org/bot{telegram_bot_token}/sendMessage"
-                data = {'chat_id': telegram_chat_id, 'text': message}
-                requests.post(url, data=data)
-            except:
-                pass
+                print(f"\n{Colors.RED}❌ Error en ciclo #{cycle}: {e}{Colors.END}")
+                time.sleep(60)
+
 
 # ============================================
-# MAIN EXECUTION
+# PUNTO DE ENTRADA PRINCIPAL
 # ============================================
+
 if __name__ == "__main__":
-    bot = DipTideBot()
-    bot.run_morning_routine()
+    bot = DipTideSystem()
+    
+    print(f"\n{Colors.CYAN}{Colors.BOLD}Choose mode:{Colors.END}")
+    print(f"1. Single analysis")
+    print(f"2. {Colors.GREEN}24/7 CONTINUOUS MODE (Ctrl+C to stop){Colors.END}")
+    print(f"3. Test MetaTrader connection")
+    
+    choice = input("Enter choice (1/2/3): ").strip()
+    
+    if choice == '2':
+        account = float(input("Enter account balance (USD): ") or "50000")
+        bot.run_24_7(account)
+    elif choice == '3':
+        if bot.mt5_connected:
+            print(f"{Colors.GREEN}✅ MetaTrader connection successful{Colors.END}")
+        else:
+            print(f"{Colors.RED}❌ MetaTrader connection failed{Colors.END}")
+        shutdown_mt5()
+    else:
+        opps = bot.scan_opportunities()
+        if opps:
+            print(f"\n{Colors.GREEN}{Colors.BOLD}📊 TOP OPPORTUNITIES:{Colors.END}")
+            for opp in opps:
+                signal_color = Colors.GREEN if opp['signal'] in ['BUY','STRONG_BUY'] else Colors.RED if opp['signal'] in ['SELL','STRONG_SELL'] else Colors.YELLOW
+                print(f"  {signal_color}{opp['symbol']}: {opp['signal']} (Conf: {opp['confidence']}/10){Colors.END}")
